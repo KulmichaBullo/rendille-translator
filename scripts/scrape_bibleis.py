@@ -1,175 +1,181 @@
 #!/usr/bin/env python3
 """
-Scrape Rendille Bible text from Bible.is (live.bible.is)
-Accurate, rate-limit-aware scraper using __NEXT_DATA__ JSON.
+Robust Rendille Bible scraper — resumable, rate-limit resilient.
 """
-import argparse
-import json
-import random
-import re
-import time
+import argparse, json, random, re, time, pickle
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── New Testament with accurate chapter counts ────────────────────────────
+# Accurate NT chapter counts
 BOOK_CHAPTERS = {
-    "MAT": 28, "MRK": 16, "LUK": 24, "JHN": 21,
-    "ACT": 28,
-    "ROM": 16, "1CO": 16, "2CO": 13, "GAL": 6, "EPH": 6, "PHP": 4, "COL": 4,
-    "1TH": 5, "2TH": 3, "1TI": 6, "2TI": 4, "TIT": 3, "PHM": 1,
-    "HEB": 13, "JAS": 5, "1PE": 5, "2PE": 3, "1JN": 5, "2JN": 1, "3JN": 1,
-    "JUD": 1, "REV": 22
+    "MAT":28,"MRK":16,"LUK":24,"JHN":21,"ACT":28,
+    "ROM":16,"1CO":16,"2CO":13,"GAL":6,"EPH":6,"PHP":4,"COL":4,
+    "1TH":5,"2TH":3,"1TI":6,"2TI":4,"TIT":3,"PHM":1,
+    "HEB":13,"JAS":5,"1PE":5,"2PE":3,"1JN":5,"2JN":1,"3JN":1,
+    "JUD":1,"REV":22
 }
 NT_BOOKS = list(BOOK_CHAPTERS.keys())
 
-RENDILLE_BIBLE_ID = "RELBTL"
-ENGLISH_BIBLE_ID = "ENGWEB"
-BASE_URL = "https://live.bible.is/bible"
+BASE = "https://live.bible.is/bible"
+REL_ID, ENG_ID = "RELBTL", "ENGWEB"
+UA_POOL = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/119.0",
+  "Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0",
+  "Mozilla/5.0 (compatible; Googlebot/2.1)",
+  "Mozilla/5.0 (compatible; Bingbot/2.0)",
+]
 
-# ── Fetch with retry + UA rotation ────────────────────────────────────────
+STATE_FILE = Path(".scrape_state.pkl")
 
-def fetch_html(bible_id: str, book: str, chapter: int) -> str:
-    url = f"{BASE_URL}/{bible_id}/{book}/{chapter}"
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (Chrome/120.0.0.0)",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (Chrome/119.0.0.0)",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (Chrome/120.0.0.0)",
-        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-        "Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bot.html)",
-    ]
-    for attempt in range(5):
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def save_state(state):
+    with open(STATE_FILE, "wb") as f:
+        pickle.dump(state, f)
+
+def load_state():
+    if STATE_FILE.exists():
+        with open(STATE_FILE, "rb") as f:
+            return pickle.load(f)
+    return {"completed": set(), "failed": {}, "total":0}
+
+def fetch_html(bid, book, chapter, retries=5):
+    url = f"{BASE}/{bid}/{book}/{chapter}"
+    for attempt in range(retries):
         try:
             import urllib.request
-            headers = {
-                "User-Agent": random.choice(user_agents),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Referer": "https://live.bible.is/",
-                "DNT": "1",
-            }
-            req = urllib.request.Request(url, headers=headers)
+            hdr = {"User-Agent": random.choice(UA_POOL),
+                   "Accept":"text/html,*/*;q=0.8",
+                   "Referer":"https://live.bible.is/"}
+            req = urllib.request.Request(url, headers=hdr)
             with urllib.request.urlopen(req, timeout=30) as r:
-                if r.status in (403, 429):
+                if r.status in (403,429):
                     raise PermissionError(f"HTTP {r.status}")
                 return r.read().decode("utf-8", errors="replace")
         except PermissionError as e:
-            if attempt == 4:
-                raise
-            wait = (2 ** attempt) + random.uniform(0, 2)
-            print(f"  Retry {attempt+1}/5 for {book} {chapter} ({e}) — {wait:.1f}s")
+            if attempt == retries-1: raise
+            wait = (2**attempt) + random.uniform(0,3)
+            print(f"  ⏳ {book} {chapter}: retry {attempt+1}/{retries} ({e}) — {wait:.1f}s")
             time.sleep(wait)
         except Exception as e:
-            if attempt == 4:
-                raise
-            time.sleep(2 ** attempt)
+            if attempt == retries-1: raise
+            time.sleep(2**attempt)
+    return None
 
-# ── Parse Next.js JSON ──────────────────────────────────────────────────────
-
-def extract_verses(html: str) -> dict:
+def extract_verses(html):
+    """Return {verse_num: text} or None if empty/invalid."""
     m = re.search(
         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
         html, re.DOTALL
     )
     if not m:
-        raise ValueError("No __NEXT_DATA__")
-    data = json.loads(m.group(1))
-    chapter_text = (
-        data.get("props", {})
-           .get("pageProps", {})
-           .get("chapterText", [])
-    )
+        return None
+    try:
+        data = json.loads(m.group(1))
+        chapter_text = data.get("props",{}).get("pageProps",{}).get("chapterText",[])
+    except (json.JSONDecodeError, AttributeError):
+        return None
     verses = {}
     for v in chapter_text:
-        num = str(v.get("verse_start", ""))
-        text = v.get("verse_text", "").strip()
+        num = str(v.get("verse_start","")).strip()
+        text = v.get("verse_text","").strip()
         if num and text:
             verses[num] = text
-    if not verses:
-        raise ValueError("No verses found")
-    return verses
+    return verses if verses else None
 
-# ── Scrape one book ────────────────────────────────────────────────────────
+# ── Scrape one chapter ─────────────────────────────────────────────────────
 
-def scrape_book(book: str, output_dir: Path) -> int:
-    rel_out = output_dir / "rel_extract.txt"
-    eng_out = output_dir / "eng_extract.txt"
-    vref_out = output_dir / "rel_vref.txt"
+def scrape_chapter(bid, book, chapter, out_dir, state):
+    key = f"{book}:{chapter}"
+    if key in state["completed"]:
+        return True, 0  # already done
 
-    verse_count = 0
-    max_chapter = BOOK_CHAPTERS[book]
+    try:
+        html = fetch_html(bid, book, chapter)
+        if not html:
+            raise ValueError("Empty response")
+        verses = extract_verses(html)
+        if not verses:
+            raise ValueError("No verses parsed")
+    except Exception as e:
+        state["failed"][key] = str(e)
+        save_state(state)
+        return False, 0
 
-    for chapter in range(1, max_chapter + 1):
-        try:
-            html_rel = fetch_html(RENDILLE_BIBLE_ID, book, chapter)
-            html_eng = fetch_html(ENGLISH_BIBLE_ID, book, chapter)
-        except Exception as e:
-            print(f"  ✗ {book} {chapter}: {e}")
-            break
+    # Append verses
+    rel_out, eng_out, vref_out = [out_dir / f for f in
+        ("rel_extract.txt","eng_extract.txt","rel_vref.txt")]
+    written = 0
+    for vnum, rel_txt in verses.items():
+        eng_txt = extract_verses(fetch_html(ENG_ID, book, chapter)) or {}
+        eng_txt = eng_txt.get(vnum, "").strip()
+        if eng_txt:
+            ref = f"{book} {chapter}:{vnum}"
+            vref_out.open("a").write(ref + "\n")
+            rel_out.open("a").write(rel_txt + "\n")
+            eng_out.open("a").write(eng_txt + "\n")
+            written += 1
 
-        try:
-            rel_verses = extract_verses(html_rel)
-            eng_verses = extract_verses(html_eng)
-        except Exception as e:
-            print(f"  ⚠ Parse fail {book} {chapter}: {e}")
-            continue
-
-        for vnum, rel_text in rel_verses.items():
-            eng_text = eng_verses.get(vnum, "").strip()
-            if eng_text:
-                ref = f"{book} {chapter}:{vnum}"
-                with open(vref_out, "a", encoding="utf-8") as vf:
-                    vf.write(ref + "\n")
-                with open(rel_out, "a", encoding="utf-8") as rf:
-                    rf.write(rel_text + "\n")
-                with open(eng_out, "a", encoding="utf-8") as ef:
-                    ef.write(eng_text + "\n")
-                verse_count += 1
-
-        if chapter % 5 == 0:
-            print(f"  {book} → ch {chapter} ({verse_count} verses)")
-
-        time.sleep(0.2)
-
-    print(f"✓ {book}: {verse_count} verses")
-    return verse_count
+    state["completed"].add(key)
+    state["total"] += written
+    save_state(state)
+    return True, written
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape Rendille Bible from Bible.is")
-    parser.add_argument("--output-dir", default="data", help="Output directory")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--output-dir", default="data")
+    ap.add_argument("--resume", action="store_true",
+                    help="Resume from previous state")
+    args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    for f in ["rel_extract.txt","eng_extract.txt","rel_vref.txt"]:
+        (out_dir/f).touch(exist_ok=True)
 
-    # Clear files at start (fresh run)
-    for f in ["rel_extract.txt", "eng_extract.txt", "rel_vref.txt"]:
-        (out_dir / f).write_text("", encoding="utf-8")
+    state = load_state() if args.resume else {"completed":set(),"failed":{}, "total":0}
+    if not args.resume:
+        # Fresh start — clear files
+        for f in ["rel_extract.txt","eng_extract.txt","rel_vref.txt"]:
+            (out_dir/f).write_text("", encoding="utf-8")
+        state = {"completed":set(),"failed":{}, "total":0}
 
-    print(f" Scraping Rendille NT → {out_dir}/ ({len(NT_BOOKS)} books)")
+    print(f"📖 Rendille NT → {out_dir}/  (resume={args.resume})")
+    print(f"   Already done: {len(state['completed'])} chapters  "
+          f"failed: {len(state['failed'])}  total verses: {state['total']}")
 
-    total = 0
+    total_verses = state["total"]
     for book in NT_BOOKS:
-        try:
-            v = scrape_book(book, out_dir)
-            total += v
-        except Exception as e:
-            print(f" ✗ {book} failed: {e}")
+        max_ch = BOOK_CHAPTERS[book]
+        for ch in range(1, max_ch+1):
+            key = f"{book}:{ch}"
+            if key in state["completed"]:
+                continue
+            ok, n = scrape_chapter(REL_ID, book, ch, out_dir, state)
+            if ok:
+                total_verses += n
+                if ch % 5 == 0:
+                    print(f"  {book} → ch {ch}  total:{total_verses}")
+            else:
+                print(f"  ✗ {book} {ch}: {state['failed'][key]}")
 
-    print(f"\n✓ Total: {total} verses")
-
-    (out_dir / "eng_vref.txt").write_text(
-        (out_dir / "rel_vref.txt").read_text(encoding="utf-8"),
+    # Duplicate vref for English
+    (out_dir/"eng_vref.txt").write_text(
+        (out_dir/"rel_vref.txt").read_text(encoding="utf-8"),
         encoding="utf-8"
     )
 
-    for f in ["rel_extract.txt", "eng_extract.txt", "rel_vref.txt", "eng_vref.txt"]:
-        p = out_dir / f
-        if p.exists():
-            lines = p.read_text(encoding="utf-8").splitlines()
-            print(f"   {p.name}: {len(lines)} lines")
+    # Summary
+    print(f"\n✅ Total verses: {total_verses}")
+    for fn in ["rel_extract.txt","eng_extract.txt","rel_vref.txt","eng_vref.txt"]:
+        p = out_dir/fn
+        n = len(p.read_text(encoding="utf-8").splitlines()) if p.exists() else 0
+        print(f"   {fn}: {n} lines")
 
-    print("\n Done! Next: run Cell [6] prepare_corpus.py")
+    print("\n👉 Next: run Cell [6] prepare_corpus.py")
 
 if __name__ == "__main__":
     main()
