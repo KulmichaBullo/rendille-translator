@@ -24,7 +24,7 @@ def main(args):
         output_dir=str(MODEL_DIR/f"rendille-{args.lang}"),
         per_device_train_batch_size=args.batch, gradient_accumulation_steps=args.accum,
         learning_rate=args.lr, num_train_epochs=args.epochs, fp16=torch.cuda.is_available(),
-        save_steps=200, eval_steps=200, logging_steps=50, predict_with_generate=True,
+        save_steps=args.save_steps, eval_steps=200, logging_steps=50, predict_with_generate=True,
     )
     # Trainer
     trainer = Seq2SeqTrainer(
@@ -42,4 +42,6 @@ if __name__ == "__main__":
     p.add_argument("--lang", default="rel"); p.add_argument("--add-token", action="store_true")
     p.add_argument("--batch", type=int, default=8); p.add_argument("--accum", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--save-steps", type=int, default=200,
+        help="Save checkpoint every N steps")
     main(p.parse_args())
