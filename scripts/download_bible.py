@@ -29,7 +29,7 @@ try:
     )
     
     rendille = []
-   english = []
+    english = []
     refs = []
     
     count = 0
@@ -51,8 +51,6 @@ try:
             
             if count % 1000 == 0:
                 print(f"    ... {count} verses collected")
-            # Remove limit for full Bible
-            # if count >= 27000: break
     
     if rendille:
         (DATA / f"{ISO}_extract.txt").write_text("\n".join(rendille), encoding='utf-8')
@@ -70,7 +68,10 @@ except Exception as e:
 # METHOD 2: Direct download from ebible.org ZIP + extract
 print("\n🔽 Method 2: Download & extract from eBible.org")
 try:
-    import requests, zipfile, io
+    import requests
+    import zipfile
+    import io
+    import csv
     
     # First, get translations.csv to find Rendille ID
     print("  Fetching translations list...")
@@ -79,7 +80,6 @@ try:
     if not r.ok:
         raise Exception(f"translations.csv failed: {r.status_code}")
     
-    import csv
     rows = list(csv.DictReader(r.text.splitlines()))
     rel_row = [row for row in rows if row.get('iso', '').lower() == ISO]
     
@@ -87,7 +87,7 @@ try:
         print(f"  ✗ Rendille (rel) not in translations.csv")
         raise Exception("Rendille not listed")
     
-    translation_id = rel_row[0]['id']  # e.g., 'rel' or 'rel_xxx'
+    translation_id = rel_row[0]['id']
     print(f"  Found Rendille translation ID: {translation_id}")
     
     # Download ZIP
@@ -99,25 +99,24 @@ try:
     
     z = zipfile.ZipFile(io.BytesIO(rz.content))
     
-    # Find USFM files (usually .usfm or .sfm)
+    # Find USFM files
     usfm_files = [f for f in z.namelist() if f.lower().endswith(('.usfm', '.sfm'))]
     print(f"  ZIP contains {len(usfm_files)} USFM files")
     
-    # Extract verses (simple extraction — concatenate USFM text)
-    # This is a simplified version; full extraction needs SILNLP
+    # For demo: extract a few sample verses
+    # Full extraction needs SIL NLP toolkit
     verses = []
-    for usfm in sorted(usfm_files)[:5]:  # Limit for demo
+    for usfm in sorted(usfm_files)[:5]:
         content = z.read(usfm).decode('utf-8', errors='replace')
-        # Very crude: split on newlines, take first line as verse reference
         for line in content.split('\n'):
             line = line.strip()
-            if line and not line.startswith('\'):
+            if line and not line.startswith('\\'):
                 verses.append(line)
                 break
     
     if verses:
         (DATA / f"{ISO}_extract.txt").write_text("\n".join(verses), encoding='utf-8')
-        (DATA / f"{ISO}_vref.txt").write_text("\n".join([f"MAT 1:1"] * len(verses)), encoding='utf-8')  # dummy refs
+        (DATA / f"{ISO}_vref.txt").write_text("\n".join(["MAT 1:1"] * len(verses)), encoding='utf-8')
         print(f"  ✓ Extracted {len(verses)} sample verses (placeholder)")
         print("  ⚠ Full extraction requires SIL NLP toolkit")
         sys.exit(0)
@@ -127,17 +126,32 @@ try:
 except Exception as e:
     print(f"  ✗ eBible.org method failed: {e}")
 
-# METHOD 3: Fallback to previously working direct URLs (if any still alive)
-print("\n🔽 Method 3: Direct file mirrors (unlikely to work)")
-print("  All methods failed. Please download manually.")
-print("\n❌ Download failed — see manual instructions below.")
+# METHOD 3: Fallback to direct mirror URLs
+print("\n🔽 Method 3: Direct file mirrors")
+mirrors = [
+    "https://ebible.org/Download/data/rel/vref.txt",
+    "https://mirror.cpunkt.de/ebible/rel/vref.txt",
+    "https://cdn.jsdelivr.net/gh/BibleNLP/ebible-corpus/data/rel/vref.txt",
+]
+for url in mirrors:
+    try:
+        import urllib.request
+        fname = url.split('/')[-1]
+        print(f"  Trying {url}...")
+        urllib.request.urlretrieve(url, DATA / fname)
+        print(f"  ✓ {fname}")
+    except Exception as e:
+        print(f"  ✗ {url}: {e}")
+
+print("\n❌ All download methods failed.")
 print("\n💡 Manual download:")
 print("  1. Go to https://ebible.org/")
 print("  2. Search for 'Rendille'")
 print("  3. Download the translation ZIP")
-print("  4. Extract and place .txt files in data/ as:")
+print("  4. Extract and place files in data/:")
 print("     - rel_vref.txt (verse references)")
 print("     - rel_extract.txt (Rendille text)")
-print("  5. Also get English: download 'eng' (World English Bible)")
+print("  5. Also get English (eng) World English Bible")
 print("     and place as eng_extract.txt")
+print("  6. Re-run prepare_corpus.py")
 sys.exit(1)
