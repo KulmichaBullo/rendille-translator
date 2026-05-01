@@ -6,14 +6,14 @@ Produces: data/rel_vref.txt, data/rel_extract.txt, data/eng_vref.txt, data/eng_e
 """
 import argparse
 import json
+import random
 import re
-import subprocess
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+# ── Rendille New Testament books ───────────────────────────────────────────
 NT_BOOKS = [
     "MAT", "MRK", "LUK", "JHN", "ACT", "ROM", "1CO", "2CO", "GAL", "EPH", "PHP", "COL",
     "1TH", "2TH", "1TI", "2TI", "TIT", "PHM", "HEB", "JAS", "1PE", "2PE", "1JN", "2JN",
@@ -24,36 +24,77 @@ RENDILLE_BIBLE_ID = "RELBTL"
 ENGLISH_BIBLE_ID = "ENGWEB"
 BASE_URL = "https://live.bible.is/bible"
 
-# ── Fetch and parse chapter text ────────────────────────────────────────────
+# ── HTTP fetch with rotation + backoff ─────────────────────────────────────
 
-def fetch_chapter_json(bible_id: str, book: str, chapter: int) -> List[Dict]:
-    """Download page, extract __NEXT_DATA__ → chapterText array."""
+def fetch_html(bible_id: str, book: str, chapter: int) -> str:
+    """Download chapter page, handling 403/429 with backoff and UA rotation."""
     url = f"{BASE_URL}/{bible_id}/{book}/{chapter}"
-    for attempt in range(3):
+
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (Chrome/120.0.0.0)",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (Chrome/119.0.0.0)",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (Chrome/120.0.0.0)",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bot.html)",
+    ]
+
+    for attempt in range(5):
         try:
             import urllib.request
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; RendilleMT/1.0)"}
-            )
+            headers = {
+                "User-Agent": random.choice(user_agents),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Referer": "https://live.bible.is/",
+                "DNT": "1",
+            }
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as r:
-                html = r.read().decode("utf-8", errors="replace")
+                if r.status in (403, 429):
+                    raise PermissionError(f"HTTP {r.status}")
+                return r.read().decode("utf-8", errors="replace")
+        except PermissionError as e:
+            if attempt == 4:
+                raise
+            wait = (2 ** attempt) + random.uniform(0, 2)
+            print(f"  Retry {attempt+1}/5 for {book} {chapter} after {e} ({wait:.1f}s)")
+            time.sleep(wait)
         except Exception as e:
-            if attempt == 2:
+            if attempt == 4:
                 raise
             time.sleep(2 ** attempt)
 
-    # Extract __NEXT_DATA__ JSON
-    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+# ── Parse __NEXT_DATA__ JSON ───────────────────────────────────────────────
+
+def extract_verses(html: str, book: str, chapter: int) -> Dict[str, str]:
+    """Parse Next.js __NEXT_DATA__ → {verse_num: verse_text}."""
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html, re.DOTALL
+    )
     if not m:
-        raise ValueError(f"No __NEXT_DATA__ found for {book} {chapter}")
+        raise ValueError(f"No __NEXT_DATA__ for {book} {chapter}")
+
     data = json.loads(m.group(1))
-    chapter_text = data.get("props", {}) \
-                      .get("pageProps", {}) \
-                      .get("chapterText", [])
-    if not chapter_text:
-        raise ValueError(f"chapterText empty for {book} {chapter}")
-    return chapter_text
+    chapter_text = (
+        data.get("props", {})
+           .get("pageProps", {})
+           .get("chapterText", [])
+    )
+
+    verses: Dict[str, str] = {}
+    for v in chapter_text:
+        num = str(v.get("verse_start", ""))
+        text = v.get("verse_text", "").strip()
+        if num and text:
+            verses[num] = text
+
+    if not verses:
+        raise ValueError(f"Empty verses for {book} {chapter}")
+
+    return verses
+
+# ── Scrape single book ──────────────────────────────────────────────────────
 
 def scrape_book(book: str, output_dir: Path) -> Tuple[int, int]:
     rel_out = output_dir / "rel_extract.txt"
@@ -65,29 +106,27 @@ def scrape_book(book: str, output_dir: Path) -> Tuple[int, int]:
 
     for chapter in range(1, 200):
         try:
-            rel_chapter = fetch_chapter_json(RENDILLE_BIBLE_ID, book, chapter)
-            eng_chapter = fetch_chapter_json(ENGLISH_BIBLE_ID, book, chapter)
+            html_rel = fetch_html(RENDILLE_BIBLE_ID, book, chapter)
+            html_eng = fetch_html(ENGLISH_BIBLE_ID, book, chapter)
         except Exception as e:
             if chapter == 1:
                 print(f"  ✗ {book} ch {chapter}: {e}")
                 return verse_count, errors
-            break  # end of book
+            break  # Reached end of book
 
-        # Build verse lookup for English (verse_start may be a range, usually single)
-        eng_map = {}
-        for v in eng_chapter:
-            vs = v.get("verse_start")
-            vt = v.get("verse_text", "").strip()
-            if vt:
-                eng_map[str(vs)] = vt
+        try:
+            rel_verses = extract_verses(html_rel, book, chapter)
+            eng_verses = extract_verses(html_eng, book, chapter)
+        except Exception as e:
+            print(f"  ⚠ Parse fail {book} {chapter}: {e}")
+            errors += 1
+            continue
 
-        # Write Rendille + English in verse order
-        for v in rel_chapter:
-            v_num = str(v.get("verse_start"))
-            rel_text = v.get("verse_text", "").strip()
-            eng_text = eng_map.get(v_num, "").strip()
-            if rel_text and eng_text:
-                ref = f"{book} {chapter}:{v_num}"
+        # Write aligned verses
+        for vnum, rel_text in rel_verses.items():
+            eng_text = eng_verses.get(vnum, "").strip()
+            if eng_text:
+                ref = f"{book} {chapter}:{vnum}"
                 with open(vref_out, "a", encoding="utf-8") as vf:
                     vf.write(ref + "\n")
                 with open(rel_out, "a", encoding="utf-8") as rf:
@@ -99,9 +138,9 @@ def scrape_book(book: str, output_dir: Path) -> Tuple[int, int]:
                 errors += 1
 
         if chapter % 5 == 0:
-            print(f"  {book} up to ch {chapter} → {verse_count} verses")
+            print(f"  {book} → ch {chapter} (total: {verse_count})")
 
-        time.sleep(0.2)  # polite
+        time.sleep(0.2)  # polite delay
 
     print(f"✓ {book}: {verse_count} verses, {errors} skipped")
     return verse_count, errors
@@ -120,25 +159,39 @@ def main():
     for f in ["rel_extract.txt", "eng_extract.txt", "rel_vref.txt"]:
         (out_dir / f).write_text("", encoding="utf-8")
 
-    print(f" Scraping Rendille NT → {out_dir}/")
-    print(f" Books: {', '.join(NT_BOOKS)}")
+    print(f" Scraping Rendille NT → {out_dir}/ ({len(NT_BOOKS)} books)")
 
     total = 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(scrape_book, bk, out_dir): bk for bk in NT_BOOKS}
-        for fut in as_completed(futures):
-            book = futures[fut]
-            try:
-                v, e = fut.result()
-                total += v
-            except Exception as exc:
-                print(f" ✗ {book} failed: {exc}")
+    failed: List[Tuple[str, str]] = []  # (book, error)
 
-    print(f"\n✓ Total: {total} verses")
+    # Retry loop — if any book fails initially, retry once after delay
+    for attempt in range(2):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(scrape_book, bk, out_dir): bk for bk in NT_BOOKS}
+            for fut in as_completed(futures):
+                book = futures[fut]
+                try:
+                    v, e = fut.result()
+                    total += v
+                except Exception as exc:
+                    failed.append((book, str(exc)))
+                    print(f" ✗ {book} failed: {exc}")
 
-    # Copy vref for English
+        if not failed or attempt > 0:
+            break
+        print(f"\n Retrying {len(failed)} failed books after 10s delay...")
+        time.sleep(10)
+        NT_BOOKS_RETRY = [b for b, _ in failed]
+        NT_BOOKS = NT_BOOKS_RETRY  # only retry failures
+
+    if failed:
+        print(f"\n Failed after retry: {failed}")
+
+    print(f"\n✓ Total verses: {total}")
+
+    # Generate English vref (same order)
     (out_dir / "eng_vref.txt").write_text(
-        (out_dir / "rel_vref.txt").read_text(),
+        (out_dir / "rel_vref.txt").read_text(encoding="utf-8"),
         encoding="utf-8"
     )
 
@@ -149,7 +202,7 @@ def main():
             lines = p.read_text(encoding="utf-8").splitlines()
             print(f"   {p.name}: {len(lines)} lines")
 
-    print("\n Done! Next: run prepare_corpus.py")
+    print("\n Done! Next: run Cell [6] prepare_corpus.py")
 
 if __name__ == "__main__":
     main()
