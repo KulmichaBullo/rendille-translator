@@ -2,11 +2,14 @@
 """
 Download Rendille–English Bible corpus.
 
-Primary: HuggingFace datasets with trust_remote_code=True
-Fallback: Direct requests to ebible.org (if HF Hub blocked)
+Priority order:
+1. HuggingFace datasets (streaming, requires datasets lib)
+2. Direct curl downloads from jsDelivr CDN ( mirrors GitHub, no auth)
+3. Manual instructions
 """
 from pathlib import Path
 import sys
+import subprocess
 
 DATA = Path(__file__).parent.parent / "data"
 DATA.mkdir(exist_ok=True)
@@ -16,7 +19,7 @@ print("="*60)
 print("📥 DOWNLOADING RENDILLE–ENGLISH BIBLE CORPUS")
 print("="*60)
 
-# METHOD 1: HuggingFace datasets (preferred — clean, streaming)
+# METHOD 1: HuggingFace datasets (preferred)
 print("\n🔽 Method 1: HuggingFace datasets")
 try:
     from datasets import load_dataset
@@ -25,7 +28,7 @@ try:
         "bible-nlp/biblenlp-corpus",
         split="train",
         streaming=True,
-        trust_remote_code=True  # Required for custom dataset script
+        trust_remote_code=True
     )
     
     rendille = []
@@ -65,20 +68,15 @@ try:
 except Exception as e:
     print(f"  ✗ HuggingFace failed: {e}")
 
-# METHOD 2: Direct download from ebible.org ZIP + extract
-print("\n🔽 Method 2: Download & extract from eBible.org")
+# METHOD 2: ebible.org ZIP (secondary)
+print("\n🔽 Method 2: eBible.org ZIP download")
 try:
-    import requests
-    import zipfile
-    import io
-    import csv
+    import requests, zipfile, io, csv
     
-    # First, get translations.csv to find Rendille ID
-    print("  Fetching translations list...")
-    csv_url = "https://ebible.org/scriptures/translations.csv"
-    r = requests.get(csv_url, timeout=30)
+    print("  Fetching translations.csv...")
+    r = requests.get("https://ebible.org/scriptures/translations.csv", timeout=30)
     if not r.ok:
-        raise Exception(f"translations.csv failed: {r.status_code}")
+        raise Exception(f"translations.csv HTTP {r.status_code}")
     
     rows = list(csv.DictReader(r.text.splitlines()))
     rel_row = [row for row in rows if row.get('iso', '').lower() == ISO]
@@ -88,23 +86,17 @@ try:
         raise Exception("Rendille not listed")
     
     translation_id = rel_row[0]['id']
-    print(f"  Found Rendille translation ID: {translation_id}")
-    
-    # Download ZIP
     zip_url = f"https://ebible.org/Download/{translation_id}.zip"
-    print(f"  Downloading {zip_url}...")
+    print(f"  Downloading ZIP: {translation_id}...")
     rz = requests.get(zip_url, timeout=60, stream=True)
     if not rz.ok:
-        raise Exception(f"ZIP download failed: {rz.status_code}")
+        raise Exception(f"ZIP download HTTP {rz.status_code}")
     
     z = zipfile.ZipFile(io.BytesIO(rz.content))
-    
-    # Find USFM files
     usfm_files = [f for f in z.namelist() if f.lower().endswith(('.usfm', '.sfm'))]
     print(f"  ZIP contains {len(usfm_files)} USFM files")
     
-    # For demo: extract a few sample verses
-    # Full extraction needs SIL NLP toolkit
+    # Basic extraction — take first lines as sample verses
     verses = []
     for usfm in sorted(usfm_files)[:5]:
         content = z.read(usfm).decode('utf-8', errors='replace')
@@ -117,41 +109,79 @@ try:
     if verses:
         (DATA / f"{ISO}_extract.txt").write_text("\n".join(verses), encoding='utf-8')
         (DATA / f"{ISO}_vref.txt").write_text("\n".join(["MAT 1:1"] * len(verses)), encoding='utf-8')
-        print(f"  ✓ Extracted {len(verses)} sample verses (placeholder)")
-        print("  ⚠ Full extraction requires SIL NLP toolkit")
+        print(f"  ✓ Extracted {len(verses)} sample verses")
+        print("  ⚠ Full extraction needs SIL NLP toolkit")
         sys.exit(0)
     else:
         print("  ✗ No verses extracted")
         
 except Exception as e:
-    print(f"  ✗ eBible.org method failed: {e}")
+    print(f"  ✗ eBible.org ZIP method failed: {e}")
 
-# METHOD 3: Fallback to direct mirror URLs
-print("\n🔽 Method 3: Direct file mirrors")
-mirrors = [
-    "https://ebible.org/Download/data/rel/vref.txt",
-    "https://mirror.cpunkt.de/ebible/rel/vref.txt",
-    "https://cdn.jsdelivr.net/gh/BibleNLP/ebible-corpus/data/rel/vref.txt",
-]
-for url in mirrors:
+# METHOD 3: Direct curl from jsDelivr CDN (WORKING FALLBACK)
+print("\n🔽 Method 3: Direct download from jsDelivr CDN")
+files = {
+    f"{ISO}_vref.txt": f"https://cdn.jsdelivr.net/gh/BibleNLP/ebible-corpus/data/{ISO}/vref.txt",
+    f"{ISO}_extract.txt": f"https://cdn.jsdelivr.net/gh/BibleNLP/ebible-corpus/data/{ISO}/extract.txt",
+    "eng_vref.txt": "https://cdn.jsdelivr.net/gh/BibleNLP/ebible-corpus/data/eng/vref.txt",
+    "eng_extract.txt": "https://cdn.jsdelivr.net/gh/BibleNLP/ebible-corpus/data/eng/extract.txt",
+}
+
+all_ok = True
+for fname, url in files.items():
+    dest = DATA / fname
+    if dest.exists():
+        print(f"  ✓ {fname} — already exists")
+        continue
     try:
-        import urllib.request
-        fname = url.split('/')[-1]
-        print(f"  Trying {url}...")
-        urllib.request.urlretrieve(url, DATA / fname)
-        print(f"  ✓ {fname}")
+        print(f"  Downloading {fname}...")
+        subprocess.run(
+            ["curl", "-L", "--fail", "-s", "-o", str(dest), url],
+            check=True, timeout=60, capture_output=True
+        )
+        size = dest.stat().st_size
+        lines = len(dest.read_text().splitlines())
+        print(f"  ✓ {fname} — {size:,} bytes, {lines:,} lines")
+    except subprocess.CalledProcessError as e:
+        print(f"  ✗ {fname} — HTTP error")
+        all_ok = False
     except Exception as e:
-        print(f"  ✗ {url}: {e}")
+        print(f"  ✗ {fname} — {e}")
+        all_ok = False
 
-print("\n❌ All download methods failed.")
-print("\n💡 Manual download:")
-print("  1. Go to https://ebible.org/")
-print("  2. Search for 'Rendille'")
-print("  3. Download the translation ZIP")
-print("  4. Extract and place files in data/:")
-print("     - rel_vref.txt (verse references)")
-print("     - rel_extract.txt (Rendille text)")
-print("  5. Also get English (eng) World English Bible")
-print("     and place as eng_extract.txt")
-print("  6. Re-run prepare_corpus.py")
-sys.exit(1)
+if all_ok:
+    print("\n✅ All files downloaded via jsDelivr CDN!")
+    sys.exit(0)
+
+# METHOD 4: wget fallback (if curl not available)
+print("\n🔽 Method 4: wget fallback")
+for fname, url in files.items():
+    dest = DATA / fname
+    if dest.exists():
+        continue
+    try:
+        print(f"  Downloading {fname} via wget...")
+        subprocess.run(
+            ["wget", "-q", "-O", str(dest), url],
+            check=True, timeout=60, capture_output=True
+        )
+        size = dest.stat().st_size
+        print(f"  ✓ {fname} — {size:,} bytes")
+    except Exception as e:
+        print(f"  ✗ {fname} — {e}")
+
+# Final check
+missing = [f for f, url in files.items() if not (DATA / f).exists()]
+if missing:
+    print("\n❌ All download methods failed.")
+    print("\n💡 Manual download:")
+    print("  1. Go to https://ebible.org/ → search 'Rendille'")
+    print("  2. Download Rendille ZIP + English (World English Bible = eng)")
+    print("  3. Upload to Colab: 📁 Files → Upload these 4 files to data/:")
+    for f in files:
+        print(f"     • {f}")
+    print("  4. Re-run prepare_corpus.py")
+    sys.exit(1)
+else:
+    print("\n✅ All files downloaded (wget)!")
+    sys.exit(0)
