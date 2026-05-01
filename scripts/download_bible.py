@@ -43,8 +43,9 @@ def download_via_huggingface():
                 english.append(texts[langs.index('eng')])
                 refs.extend(ex['ref'] if isinstance(ex['ref'], list) else [ex['ref']])
                 # Limit for demo; remove [:1000] for full Bible
-                if len(rendille) >= 1000:
-                    break
+                # Remove limit to get full Bible
+                # (Full NT is ~27K verses — still small <5 MB)
+                pass  # let it run through all
         
         if rendille:
             (DATA / f"{ISO}_extract.txt").write_text("\n".join(rendille), encoding='utf-8')
