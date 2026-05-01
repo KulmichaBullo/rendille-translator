@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 """
 Scrape Rendille Bible text from Bible.is (live.bible.is)
-Uses Next.js __NEXT_DATA__ embedded JSON.
-Produces: data/rel_vref.txt, data/rel_extract.txt, data/eng_vref.txt, data/eng_extract.txt
+Accurate, rate-limit-aware scraper using __NEXT_DATA__ JSON.
 """
 import argparse
 import json
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Tuple
 
-# ── Rendille New Testament books ───────────────────────────────────────────
-NT_BOOKS = [
-    "MAT", "MRK", "LUK", "JHN", "ACT", "ROM", "1CO", "2CO", "GAL", "EPH", "PHP", "COL",
-    "1TH", "2TH", "1TI", "2TI", "TIT", "PHM", "HEB", "JAS", "1PE", "2PE", "1JN", "2JN",
-    "3JN", "JUD", "REV"
-]
+# ── New Testament with accurate chapter counts ────────────────────────────
+BOOK_CHAPTERS = {
+    "MAT": 28, "MRK": 16, "LUK": 24, "JHN": 21,
+    "ACT": 28,
+    "ROM": 16, "1CO": 16, "2CO": 13, "GAL": 6, "EPH": 6, "PHP": 4, "COL": 4,
+    "1TH": 5, "2TH": 3, "1TI": 6, "2TI": 4, "TIT": 3, "PHM": 1,
+    "HEB": 13, "JAS": 5, "1PE": 5, "2PE": 3, "1JN": 5, "2JN": 1, "3JN": 1,
+    "JUD": 1, "REV": 22
+}
+NT_BOOKS = list(BOOK_CHAPTERS.keys())
 
 RENDILLE_BIBLE_ID = "RELBTL"
 ENGLISH_BIBLE_ID = "ENGWEB"
 BASE_URL = "https://live.bible.is/bible"
 
-# ── HTTP fetch with rotation + backoff ─────────────────────────────────────
+# ── Fetch with retry + UA rotation ────────────────────────────────────────
 
 def fetch_html(bible_id: str, book: str, chapter: int) -> str:
-    """Download chapter page, handling 403/429 with backoff and UA rotation."""
     url = f"{BASE_URL}/{bible_id}/{book}/{chapter}"
-
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (Chrome/120.0.0.0)",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (Chrome/119.0.0.0)",
@@ -37,7 +36,6 @@ def fetch_html(bible_id: str, book: str, chapter: int) -> str:
         "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
         "Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bot.html)",
     ]
-
     for attempt in range(5):
         try:
             import urllib.request
@@ -57,72 +55,63 @@ def fetch_html(bible_id: str, book: str, chapter: int) -> str:
             if attempt == 4:
                 raise
             wait = (2 ** attempt) + random.uniform(0, 2)
-            print(f"  Retry {attempt+1}/5 for {book} {chapter} after {e} ({wait:.1f}s)")
+            print(f"  Retry {attempt+1}/5 for {book} {chapter} ({e}) — {wait:.1f}s")
             time.sleep(wait)
         except Exception as e:
             if attempt == 4:
                 raise
             time.sleep(2 ** attempt)
 
-# ── Parse __NEXT_DATA__ JSON ───────────────────────────────────────────────
+# ── Parse Next.js JSON ──────────────────────────────────────────────────────
 
-def extract_verses(html: str, book: str, chapter: int) -> Dict[str, str]:
-    """Parse Next.js __NEXT_DATA__ → {verse_num: verse_text}."""
+def extract_verses(html: str) -> dict:
     m = re.search(
         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
         html, re.DOTALL
     )
     if not m:
-        raise ValueError(f"No __NEXT_DATA__ for {book} {chapter}")
-
+        raise ValueError("No __NEXT_DATA__")
     data = json.loads(m.group(1))
     chapter_text = (
         data.get("props", {})
            .get("pageProps", {})
            .get("chapterText", [])
     )
-
-    verses: Dict[str, str] = {}
+    verses = {}
     for v in chapter_text:
         num = str(v.get("verse_start", ""))
         text = v.get("verse_text", "").strip()
         if num and text:
             verses[num] = text
-
     if not verses:
-        raise ValueError(f"Empty verses for {book} {chapter}")
-
+        raise ValueError("No verses found")
     return verses
 
-# ── Scrape single book ──────────────────────────────────────────────────────
+# ── Scrape one book ────────────────────────────────────────────────────────
 
-def scrape_book(book: str, output_dir: Path) -> Tuple[int, int]:
+def scrape_book(book: str, output_dir: Path) -> int:
     rel_out = output_dir / "rel_extract.txt"
     eng_out = output_dir / "eng_extract.txt"
     vref_out = output_dir / "rel_vref.txt"
 
     verse_count = 0
-    errors = 0
+    max_chapter = BOOK_CHAPTERS[book]
 
-    for chapter in range(1, 200):
+    for chapter in range(1, max_chapter + 1):
         try:
             html_rel = fetch_html(RENDILLE_BIBLE_ID, book, chapter)
             html_eng = fetch_html(ENGLISH_BIBLE_ID, book, chapter)
         except Exception as e:
-            if chapter == 1:
-                print(f"  ✗ {book} ch {chapter}: {e}")
-                return verse_count, errors
-            break  # Reached end of book
+            print(f"  ✗ {book} {chapter}: {e}")
+            break
 
         try:
-            rel_verses = extract_verses(html_rel, book, chapter)
-            eng_verses = extract_verses(html_eng, book, chapter)
+            rel_verses = extract_verses(html_rel)
+            eng_verses = extract_verses(html_eng)
         except Exception as e:
             print(f"  ⚠ Parse fail {book} {chapter}: {e}")
-            errors += 1
             continue
 
-        # Write aligned verses
         for vnum, rel_text in rel_verses.items():
             eng_text = eng_verses.get(vnum, "").strip()
             if eng_text:
@@ -134,16 +123,14 @@ def scrape_book(book: str, output_dir: Path) -> Tuple[int, int]:
                 with open(eng_out, "a", encoding="utf-8") as ef:
                     ef.write(eng_text + "\n")
                 verse_count += 1
-            else:
-                errors += 1
 
         if chapter % 5 == 0:
-            print(f"  {book} → ch {chapter} (total: {verse_count})")
+            print(f"  {book} → ch {chapter} ({verse_count} verses)")
 
-        time.sleep(0.2)  # polite delay
+        time.sleep(0.2)
 
-    print(f"✓ {book}: {verse_count} verses, {errors} skipped")
-    return verse_count, errors
+    print(f"✓ {book}: {verse_count} verses")
+    return verse_count
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
@@ -155,48 +142,27 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clear targets
+    # Clear files at start (fresh run)
     for f in ["rel_extract.txt", "eng_extract.txt", "rel_vref.txt"]:
         (out_dir / f).write_text("", encoding="utf-8")
 
     print(f" Scraping Rendille NT → {out_dir}/ ({len(NT_BOOKS)} books)")
 
     total = 0
-    failed: List[Tuple[str, str]] = []  # (book, error)
+    for book in NT_BOOKS:
+        try:
+            v = scrape_book(book, out_dir)
+            total += v
+        except Exception as e:
+            print(f" ✗ {book} failed: {e}")
 
-    # Retry loop — if any book fails initially, retry once after delay
-    books_to_scrape = NT_BOOKS[:]  # mutable copy
-    for attempt in range(2):
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(scrape_book, bk, out_dir): bk for bk in books_to_scrape}
-            for fut in as_completed(futures):
-                book = futures[fut]
-                try:
-                    v, e = fut.result()
-                    total += v
-                except Exception as exc:
-                    failed.append((book, str(exc)))
-                    print(f" ✗ {book} failed: {exc}")
+    print(f"\n✓ Total: {total} verses")
 
-        if not failed or attempt > 0:
-            break
-        print(f"\n Retrying {len(failed)} failed books after 10s delay...")
-        time.sleep(10)
-        books_to_scrape = [b for b, _ in failed]  # only retry failures
-        failed.clear()  # reset for retry pass
-
-    if failed:
-        print(f"\n Failed after retry: {failed}")
-
-    print(f"\n✓ Total verses: {total}")
-
-    # Generate English vref (same order)
     (out_dir / "eng_vref.txt").write_text(
         (out_dir / "rel_vref.txt").read_text(encoding="utf-8"),
         encoding="utf-8"
     )
 
-    # Summary
     for f in ["rel_extract.txt", "eng_extract.txt", "rel_vref.txt", "eng_vref.txt"]:
         p = out_dir / f
         if p.exists():
