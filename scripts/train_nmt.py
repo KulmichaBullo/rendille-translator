@@ -8,6 +8,22 @@ def main(args):
     DATA = Path("data"); MODEL_DIR = Path("models")
     MODEL_DIR.mkdir(exist_ok=True)
     print(f"✓ models/ dir created: {MODEL_DIR.resolve()}")
+    
+    # Pre-check: ensure dataset files exist
+    required = ["train.txt", "val.txt", "test.txt"]
+    missing = [f for f in required if not (DATA/f).exists()]
+    if missing:
+        print(f"⚠ Missing dataset files: {missing}")
+        print("  Running prepare_corpus.py to generate them...")
+        import subprocess
+        subprocess.run(["python", "scripts/prepare_corpus.py"], check=False)
+        # Check again
+        missing = [f for f in required if not (DATA/f).exists()]
+        if missing:
+            print(f"✗ Still missing after prepare: {missing}")
+            print("  Please run Cell [6] manually: !python scripts/prepare_corpus.py")
+            return
+    
     print("Loading dataset...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     # TODO: implement dataset loading

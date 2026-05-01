@@ -30,7 +30,31 @@ if vref and rel_text and eng_text and len(rel_text) == len(eng_text) == len(vref
         out = DATA/f"{split}.txt"
         out.write_text("\n".join(f"{src} ||| {tgt}" for src, tgt in data))
         print(f"✓ {split}: {len(data)} lines → {out}")
+        
+    # Verify all splits created
+    all_ok = True
+    for split in ["train", "val", "test"]:
+        f = DATA/f"{split}.txt"
+        if f.exists():
+            lines = f.read_text().splitlines()
+            print(f"✓ VERIFIED: {f.name} — {len(lines)} lines")
+            # Show a sample
+            if lines:
+                print(f"  Sample: {lines[0][:80]}...")
+        else:
+            print(f"✗ MISSING: {f.name}")
+            all_ok = False
+    
+    if not all_ok:
+        print("✗ Some split files missing — check errors above")
+        exit(1)
 else:
     print("ERROR: Missing files or length mismatch")
-    print("  Expected: rel_vref.txt, rel_extract.txt, eng_extract.txt all same length")
+    print(f"  Checks:")
+    print(f"    rel_vref.txt exists: {(DATA/'rel_vref.txt').exists()}, lines: {len(vref) if vref else 0}")
+    print(f"    rel_extract.txt exists: {(DATA/'rel_extract.txt').exists()}, lines: {len(rel_text) if rel_text else 0}")
+    print(f"    eng_extract.txt exists: {(DATA/'eng_extract.txt').exists()}, lines: {len(eng_text) if eng_text else 0}")
+    if rel_text and eng_text:
+        print(f"    Lengths match: {len(rel_text)} == {len(eng_text)} → {len(rel_text)==len(eng_text)}")
+    print("  All three files must exist and have the same number of lines.")
     exit(1)
