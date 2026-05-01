@@ -165,9 +165,10 @@ def main():
     failed: List[Tuple[str, str]] = []  # (book, error)
 
     # Retry loop — if any book fails initially, retry once after delay
+    books_to_scrape = NT_BOOKS[:]  # mutable copy
     for attempt in range(2):
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(scrape_book, bk, out_dir): bk for bk in NT_BOOKS}
+            futures = {pool.submit(scrape_book, bk, out_dir): bk for bk in books_to_scrape}
             for fut in as_completed(futures):
                 book = futures[fut]
                 try:
@@ -181,8 +182,8 @@ def main():
             break
         print(f"\n Retrying {len(failed)} failed books after 10s delay...")
         time.sleep(10)
-        NT_BOOKS_RETRY = [b for b, _ in failed]
-        NT_BOOKS = NT_BOOKS_RETRY  # only retry failures
+        books_to_scrape = [b for b, _ in failed]  # only retry failures
+        failed.clear()  # reset for retry pass
 
     if failed:
         print(f"\n Failed after retry: {failed}")
