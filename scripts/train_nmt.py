@@ -6,6 +6,8 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 def main(args):
     DATA = Path("data"); MODEL_DIR = Path("models")
+    MODEL_DIR.mkdir(exist_ok=True)
+    print(f"✓ models/ dir created: {MODEL_DIR.resolve()}")
     print("Loading dataset...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     # TODO: implement dataset loading
