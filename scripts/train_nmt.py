@@ -29,11 +29,63 @@ def main(args):
     # Data collator for seq2seq (new in Transformers 4.35+)
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
     
-    # Trainer (tokenizer removed — use data_collator instead)
+    # Load datasets from prepared text files
+    from datasets import load_dataset
+    
+    def load_split(split_file):
+        """Load a parallel text split with 'src ||| tgt' format."""
+        dataset = load_dataset(
+            "text",
+            data_files={"text": str(DATA / split_file)},
+            split="train"
+        )
+        # Parse parallel lines: "Rendille text ||| English text"
+        def parse_pair(example):
+            src, tgt = example["text"].split("|||")
+            return {"src": src.strip(), "tgt": tgt.strip()}
+        
+        dataset = dataset.map(parse_pair, desc=f"Parsing {split_file}")
+        # Tokenize for NLLB
+        def preprocess(example):
+            # NLLB expects input_ids and labels
+            # For fine-tuning on parallel text: input = source, labels = target
+            src_tok = tokenizer(
+                example["src"],
+                truncation=True,
+                max_length=200,
+                padding="max_length"
+            )
+            tgt_tok = tokenizer(
+                example["tgt"],
+                truncation=True,
+                max_length=200,
+                padding="max_length"
+            )
+            return {
+                "input_ids": src_tok["input_ids"],
+                "attention_mask": src_tok["attention_mask"],
+                "labels": tgt_tok["input_ids"],
+            }
+        
+        tokenized = dataset.map(
+            preprocess,
+            remove_columns=["text", "src", "tgt"],
+            desc=f"Tokenizing {split_file}"
+        )
+        return tokenized
+
+    print("Loading datasets...")
+    train_dataset = load_split("train.txt")
+    eval_dataset = load_split("val.txt")
+    print(f"  Train: {len(train_dataset)} examples")
+    print(f"  Val:   {len(eval_dataset)} examples")
+    
+    # Trainer
     trainer = Seq2SeqTrainer(
-        model=model, args=training_args,
-        train_dataset=None,  # TODO: load_dataset("text", data_files={"train": str(DATA/"train.txt")})
-        eval_dataset=None,
+        model=model, 
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
     )
     trainer.train(); trainer.save_model()
