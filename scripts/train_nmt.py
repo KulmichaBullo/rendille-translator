@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse, torch
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import (AutoTokenizer, AutoModelForSeq2SeqLM, Seq2SeqTrainer, Seq2SeqTrainingArguments, DataCollatorForSeq2Seq)
 from peft import LoraConfig, get_peft_model, TaskType
 
 def main(args):
@@ -26,12 +26,15 @@ def main(args):
         learning_rate=args.lr, num_train_epochs=args.epochs, fp16=torch.cuda.is_available(),
         save_steps=args.save_steps, eval_steps=200, logging_steps=50, predict_with_generate=True,
     )
-    # Trainer
+    # Data collator for seq2seq (new in Transformers 4.35+)
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+    
+    # Trainer (tokenizer removed — use data_collator instead)
     trainer = Seq2SeqTrainer(
         model=model, args=training_args,
-        train_dataset=None, # TODO: load_dataset("text", data_files={"train": str(DATA/"train.txt")})
+        train_dataset=None,  # TODO: load_dataset("text", data_files={"train": str(DATA/"train.txt")})
         eval_dataset=None,
-        tokenizer=tokenizer,
+        data_collator=data_collator,
     )
     trainer.train(); trainer.save_model()
     print("✅ Model saved")
