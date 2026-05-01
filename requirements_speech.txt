@@ -1,0 +1,11 @@
+# Additional packages for speech-to-speech pipeline
+openai-whisper>=20231117
+TTS>=0.22.0
+ffmpeg-python>=0.2.0
+jiwer>=2.5.0  # WER metric
+librosa>=0.10.0  # audio analysis
+soundfile>=0.12.1
+pydub>=0.25.1
+gradio>=4.0.0  # web demo
+fastapi>=0.104.0  # optional API server
+uvicorn>=0.24.0
